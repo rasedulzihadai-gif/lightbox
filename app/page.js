@@ -72,39 +72,56 @@ const StatusDot = memo(function StatusDot({ status }) {
 // re-rendering them. This turns a full-list re-render on every status
 // change (O(n) work per update, O(n²) over a whole batch) into O(1) work
 // per update, which is the main fix for batch-mode lag.
-const FilmstripRow = memo(function FilmstripRow({ item, idx, isActive, onSelect }) {
+const FilmstripRow = memo(function FilmstripRow({ item, idx, isActive, onSelect, onRemove }) {
   return (
-    <button
-      onClick={() => onSelect(idx)}
+    <div
       style={{
-        display: "flex", alignItems: "center", gap: 10, width: "100%",
-        padding: "8px", marginBottom: 4, borderRadius: 10,
+        display: "flex", alignItems: "center", gap: 6, width: "100%",
+        marginBottom: 4, borderRadius: 10,
         background: isActive ? "var(--panel-raised)" : "transparent",
         border: isActive ? "1px solid var(--border)" : "1px solid transparent",
         boxShadow: isActive ? "var(--shadow)" : "none",
-        cursor: "pointer", textAlign: "left",
       }}
     >
-      <span style={{
-        width: 34, height: 34, borderRadius: 8, background: "var(--panel-raised)",
-        flexShrink: 0, overflow: "hidden", border: "1px solid var(--border-soft)",
-      }}>
-        <img
-          src={item.previewUrl}
-          alt=""
-          loading="lazy"
-          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-        />
-      </span>
-      <span style={{ flex: 1, minWidth: 0 }}>
-        <div style={{
-          fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+      <button
+        onClick={() => onSelect(idx)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0,
+          padding: "8px", background: "none", border: "none",
+          cursor: "pointer", textAlign: "left",
+        }}
+      >
+        <span style={{
+          width: 34, height: 34, borderRadius: 8, background: "var(--panel-raised)",
+          flexShrink: 0, overflow: "hidden", border: "1px solid var(--border-soft)",
         }}>
-          {item.filename}
-        </div>
-        <StatusDot status={item.status} />
-      </span>
-    </button>
+          <img
+            src={item.previewUrl}
+            alt=""
+            loading="lazy"
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          />
+        </span>
+        <span style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>
+            {item.filename}
+          </div>
+          <StatusDot status={item.status} />
+        </span>
+      </button>
+      <button
+        onClick={() => onRemove(idx)}
+        aria-label={`Remove ${item.filename}`}
+        style={{
+          background: "none", border: "none", color: "var(--text-faint)",
+          cursor: "pointer", fontSize: 15, lineHeight: 1, padding: "6px 8px", flexShrink: 0,
+        }}
+      >
+        ×
+      </button>
+    </div>
   );
 });
 
@@ -141,6 +158,9 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState("adobe_stock");
   const [running, setRunning] = useState(false);
   const [theme, setTheme] = useState("dark");
+  const [copiedField, setCopiedField] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounter = useRef(0);
 
   useEffect(() => {
     const savedTheme = localStorage.getItem("mstock_theme") || "dark";
@@ -210,6 +230,54 @@ export default function Home() {
       if (activeIndex === null && merged.length > 0) setActiveIndex(prev.length);
       return merged;
     });
+  }
+
+  function removeItem(index) {
+    setItems((prev) => {
+      const copy = [...prev];
+      const [removed] = copy.splice(index, 1);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return copy;
+    });
+    setActiveIndex((prev) => {
+      if (prev === null) return prev;
+      if (prev === index) return null;
+      if (prev > index) return prev - 1;
+      return prev;
+    });
+  }
+
+  function copyToClipboard(text, field) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    setCopiedField(field);
+    setTimeout(() => setCopiedField((f) => (f === field ? null : f)), 1500);
+  }
+
+  // Drag counter avoids the flicker from dragenter/dragleave firing on
+  // every child element as the pointer moves across the drop zone —
+  // only the balanced 0->1 and 1->0 transitions toggle the highlight.
+  function handleDragEnter(e) {
+    e.preventDefault();
+    dragCounter.current += 1;
+    setIsDragging(true);
+  }
+  function handleDragOver(e) {
+    e.preventDefault();
+  }
+  function handleDragLeave(e) {
+    e.preventDefault();
+    dragCounter.current -= 1;
+    if (dragCounter.current <= 0) {
+      dragCounter.current = 0;
+      setIsDragging(false);
+    }
+  }
+  function handleDrop(e) {
+    e.preventDefault();
+    dragCounter.current = 0;
+    setIsDragging(false);
+    const files = Array.from(e.dataTransfer.files || []).filter((f) => f.type.startsWith("image/"));
+    if (files.length > 0) handleFiles(files);
   }
 
   // Revoke object URLs when the component unmounts, to avoid leaking memory
@@ -391,6 +459,7 @@ export default function Home() {
                         idx={idx}
                         isActive={activeIndex === idx}
                         onSelect={selectItem}
+                        onRemove={removeItem}
                       />
                     );
                   })}
@@ -408,6 +477,11 @@ export default function Home() {
           >
             {running ? "Generating…" : "Generate all"}
           </button>
+          {items.length > 0 && (
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8, textAlign: "center" }}>
+              {doneItems.length} of {items.length} ready
+            </div>
+          )}
         </div>
       </aside>
 
@@ -420,24 +494,72 @@ export default function Home() {
           display: "flex", justifyContent: "space-between", alignItems: "center",
           padding: "14px 24px", borderBottom: "1px solid var(--border-soft)",
         }}>
-          <input
-            value={context}
-            onChange={(e) => setContext(e.target.value)}
-            placeholder="Optional context — e.g. corporate, wedding, nature/travel"
-            style={contextInput}
-          />
-          <button onClick={() => setShowSettings(true)} style={{ ...ghostBtn, marginLeft: 12, whiteSpace: "nowrap" }}>
+          <div style={{ position: "relative", flex: 1 }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{
+              position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)",
+              color: "var(--text-faint)", pointerEvents: "none",
+            }}>
+              <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+            </svg>
+            <input
+              value={context}
+              onChange={(e) => setContext(e.target.value)}
+              placeholder="Optional context — e.g. corporate, wedding, nature/travel"
+              style={{ ...contextInput, width: "100%", paddingLeft: 32 }}
+            />
+          </div>
+          <button onClick={() => setShowSettings(true)} style={{ ...ghostBtn, marginLeft: 12, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span style={{
               display: "inline-block", width: 6, height: 6, borderRadius: "50%",
               background: keyStatus === "connected" ? "var(--teal)" : "var(--text-faint)",
-              marginRight: 6,
             }} />
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+              <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke="currentColor" strokeWidth="1.6" />
+              <path d="M19.4 13a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V19a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H4a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H10a1.65 1.65 0 001-1.51V4a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V10a1.65 1.65 0 001.51 1H20a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" strokeWidth="1.3" />
+            </svg>
             Settings
           </button>
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-          {!active && (
+        <div
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          style={{ flex: 1, overflowY: "auto", padding: 24, position: "relative" }}
+        >
+          {!active && items.length === 0 && (
+            <div style={{
+              height: "100%", minHeight: 420, display: "flex", flexDirection: "column",
+              alignItems: "center", justifyContent: "center", textAlign: "center",
+              border: `1.5px dashed ${isDragging ? "var(--accent)" : "var(--border)"}`,
+              borderRadius: 14, padding: 24,
+              background: isDragging ? "var(--panel-raised)" : "transparent",
+              transition: "border-color .15s ease, background .15s ease",
+            }}>
+              <div style={{
+                width: 44, height: 44, borderRadius: 10, background: "var(--panel-raised)",
+                border: "1px solid var(--border)", display: "flex", alignItems: "center",
+                justifyContent: "center", marginBottom: 16, color: "var(--text-dim)",
+              }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M5 16v2a2 2 0 002 2h10a2 2 0 002-2v-2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                </svg>
+              </div>
+              <div style={{ fontFamily: "var(--font-display)", fontWeight: 500, fontSize: 18, color: "var(--text)", marginBottom: 8 }}>
+                Drop images to get started
+              </div>
+              <div style={{ fontSize: 13, color: "var(--text-faint)", maxWidth: 340, lineHeight: 1.6, marginBottom: 18 }}>
+                Drag JPG or PNG files anywhere on this canvas. We resize them locally before analysis.
+              </div>
+              <button onClick={() => fileInputRef.current.click()} style={ghostBtn}>
+                Browse files
+              </button>
+            </div>
+          )}
+
+          {!active && items.length > 0 && (
             <div style={{
               height: "100%", display: "flex", flexDirection: "column",
               alignItems: "center", justifyContent: "center", color: "var(--text-faint)",
@@ -468,6 +590,18 @@ export default function Home() {
                     </h2>
                     <StatusDot status={active.status} />
                   </div>
+
+                  {active.result && active.status !== "processing" && (
+                    <button
+                      onClick={() => processOne(activeIndex)}
+                      style={{ ...ghostBtn, marginTop: 10, display: "inline-flex", alignItems: "center", gap: 6 }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                        <path d="M20 11a8 8 0 10-2.34 5.66M20 4v6h-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      Regenerate
+                    </button>
+                  )}
 
               {active.status === "error" && (
                 <div style={{
@@ -506,16 +640,32 @@ export default function Home() {
                   </div>
 
                   <div style={{ marginBottom: 18 }}>
-                    <label style={sectionLabel}>Title</label>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <label style={sectionLabel}>Title</label>
+                      <button
+                        onClick={() => copyToClipboard(active.result.platforms[activeTab]?.title || "", "title")}
+                        style={copyBtn}
+                      >
+                        {copiedField === "title" ? "Copied" : "Copy"}
+                      </button>
+                    </div>
                     <div style={{ ...fieldBox, fontFamily: "var(--font-display)", fontSize: 15 }}>
                       {active.result.platforms[activeTab]?.title}
                     </div>
                   </div>
 
                   <div>
-                    <label style={sectionLabel}>
-                      Keywords ({active.result.platforms[activeTab]?.keywords.length})
-                    </label>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <label style={sectionLabel}>
+                        Keywords ({active.result.platforms[activeTab]?.keywords.length})
+                      </label>
+                      <button
+                        onClick={() => copyToClipboard((active.result.platforms[activeTab]?.keywords || []).join(", "), "keywords")}
+                        style={copyBtn}
+                      >
+                        {copiedField === "keywords" ? "Copied" : "Copy"}
+                      </button>
+                    </div>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
                       {active.result.platforms[activeTab]?.keywords.map((kw, i) => (
                         <KeywordChip key={`${kw}-${i}`} text={kw} onRemove={() => removeKeyword(activeIndex, activeTab, i)} />
@@ -622,6 +772,10 @@ const tabActive = {
 };
 const tabInactive = { ...tabActive, background: "transparent", color: "var(--text-dim)", fontWeight: 400 };
 const sectionLabel = { fontSize: 12, color: "var(--text-faint)", letterSpacing: 0 };
+const copyBtn = {
+  background: "none", border: "none", color: "var(--text-faint)",
+  cursor: "pointer", fontSize: 11.5, padding: "2px 4px",
+};
 const fieldBox = {
   marginTop: 6, padding: "10px 12px", background: "var(--panel-raised)",
   border: "1px solid var(--border-soft)", borderRadius: 8,
