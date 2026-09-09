@@ -1,6 +1,10 @@
 "use client";
-import { useState, useEffect, useRef, useCallback, memo } from "react";
-import { buildAdobeStockCsv, buildShutterstockCsv, buildFreepikCsv, buildVecteezyCsv, buildIstockGettyCsv, downloadCsv } from "../lib/csv";
+import { useState, useEffect, useRef, useCallback, memo, useMemo } from "react";
+import {
+  buildAdobeStockCsv, buildShutterstockCsv, buildFreepikCsv, buildVecteezyCsv,
+  buildIstockGettyCsv, validateFreepikRows, downloadCsv,
+} from "../lib/csv";
+import { analyzeKeywords, gradeColor } from "../lib/keywords";
 
 const PLATFORM_TABS = [
   { key: "adobe_stock", label: "Adobe Stock" },
@@ -48,8 +52,8 @@ function resizeImage(file, maxDim = 1200) {
 
 const StatusDot = memo(function StatusDot({ status }) {
   const color =
-    status === "done" ? "var(--teal)" :
-    status === "error" ? "var(--red)" :
+    status === "done" ? "var(--success)" :
+    status === "error" ? "var(--danger)" :
     status === "processing" ? "var(--accent)" : "var(--text-faint)";
   const label =
     status === "done" ? "Ready" :
@@ -74,21 +78,13 @@ const StatusDot = memo(function StatusDot({ status }) {
 // per update, which is the main fix for batch-mode lag.
 const FilmstripRow = memo(function FilmstripRow({ item, idx, isActive, onSelect, onRemove }) {
   return (
-    <div
-      style={{
-        display: "flex", alignItems: "center", gap: 6, width: "100%",
-        marginBottom: 4, borderRadius: 10,
-        background: isActive ? "var(--panel-raised)" : "transparent",
-        border: isActive ? "1px solid var(--border)" : "1px solid transparent",
-        boxShadow: isActive ? "var(--shadow)" : "none",
-      }}
-    >
+    <div className={`filmstrip-row${isActive ? " active" : ""}`}>
       <button
         onClick={() => onSelect(idx)}
         style={{
           display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0,
           padding: "8px", background: "none", border: "none",
-          cursor: "pointer", textAlign: "left",
+          cursor: "pointer", textAlign: "left", color: "var(--text)",
         }}
       >
         <span style={{
@@ -125,26 +121,28 @@ const FilmstripRow = memo(function FilmstripRow({ item, idx, isActive, onSelect,
   );
 });
 
-function KeywordChip({ text, onRemove }) {
+function KeywordChip({ text, verdict, reasons, onRemove }) {
   return (
-    <span style={{
-      display: "inline-flex", alignItems: "center", gap: 6,
-      fontFamily: "var(--font-mono)", fontSize: 12,
-      background: "var(--panel-raised)", border: "1px solid var(--border)",
-      borderRadius: 999, padding: "4px 10px", color: "var(--text)",
-    }}>
+    <span className={`kw-chip ${verdict}`} title={reasons.join(" · ")}>
+      <span className="kw-dot" />
       {text}
-      <button
-        onClick={onRemove}
-        aria-label={`Remove ${text}`}
-        style={{
-          background: "none", border: "none", color: "var(--text-faint)",
-          cursor: "pointer", fontSize: 13, lineHeight: 1, padding: 0,
-        }}
-      >
-        ×
-      </button>
+      <button onClick={onRemove} aria-label={`Remove ${text}`}>×</button>
     </span>
+  );
+}
+
+function ScoreBadge({ analysis }) {
+  const c = gradeColor(analysis.grade);
+  return (
+    <div className="score-badge">
+      <span className="score-ring" style={{ background: c }}>{analysis.score}</span>
+      <span>
+        SEO Score <span style={{ color: c }}>{analysis.grade}</span>
+        <span style={{ fontWeight: 400, color: "var(--text-faint)", marginLeft: 8, fontSize: 11.5 }}>
+          ✓ {analysis.counts.good} good · ⚠ {analysis.counts.weak} weak · ✕ {analysis.counts.bad} bad
+        </span>
+      </span>
+    </div>
   );
 }
 
@@ -161,6 +159,11 @@ export default function Home() {
   const [copiedField, setCopiedField] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const dragCounter = useRef(0);
+  // Freepik export dialog state
+  const [showFreepik, setShowFreepik] = useState(false);
+  const [aiGenerated, setAiGenerated] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiModel, setAiModel] = useState("");
 
   useEffect(() => {
     const savedTheme = localStorage.getItem("mstock_theme") || "dark";
@@ -363,11 +366,45 @@ export default function Home() {
   const doneItems = items.filter((it) => it.status === "done");
   const active = activeIndex !== null ? items[activeIndex] : null;
 
+  // Keyword quality analysis for the visible platform tab — recomputed
+  // whenever the result, tab, or selection changes (incl. chip removal).
+  const analysis = useMemo(() => {
+    if (!active?.result?.platforms?.[activeTab]) return null;
+    const meta = active.result.platforms[activeTab];
+    return analyzeKeywords(activeTab, meta.title, meta.keywords);
+  }, [active, activeTab]);
+
+  const verdictByIndex = useMemo(() => {
+    const map = {};
+    if (!analysis) return map;
+    analysis.good.forEach((g) => { map[g.index] = { verdict: "good", reasons: g.reasons }; });
+    analysis.weak.forEach((w) => { map[w.index] = { verdict: "weak", reasons: w.reasons }; });
+    analysis.bad.forEach((b) => { map[b.index] = { verdict: "bad", reasons: b.reasons }; });
+    return map;
+  }, [analysis]);
+
+  // Freepik pre-upload validation — recomputed live as AI toggle changes.
+  const freepikIssues = useMemo(
+    () => (showFreepik ? validateFreepikRows(doneItems, { aiGenerated }) : []),
+    [showFreepik, doneItems, aiGenerated]
+  );
+  const freepikErrors = freepikIssues.filter((i) => i.level === "error");
+  const freepikWarnings = freepikIssues.filter((i) => i.level === "warning");
+  const freepikErrorRows = useMemo(() => new Set(freepikErrors.map((e) => e.row)), [freepikErrors]);
+
+  function downloadFreepikCsv(onlyValid) {
+    const rows = onlyValid
+      ? doneItems.filter((_, i) => !freepikErrorRows.has(i + 1))
+      : doneItems;
+    const csv = buildFreepikCsv(rows, { aiGenerated, prompt: aiPrompt, model: aiModel });
+    downloadCsv(csv, aiGenerated ? "freepik_ai.csv" : "freepik.csv");
+    setShowFreepik(false);
+  }
+
   function exportCsv(platform) {
     let csv, name;
     if (platform === "adobe_stock") { csv = buildAdobeStockCsv(doneItems); name = "adobe_stock.csv"; }
     else if (platform === "shutterstock") { csv = buildShutterstockCsv(doneItems); name = "shutterstock.csv"; }
-    else if (platform === "freepik_vecteezy") { csv = buildFreepikCsv(doneItems); name = "freepik.csv"; }
     else if (platform === "vecteezy") { csv = buildVecteezyCsv(doneItems); name = "vecteezy.csv"; }
     else if (platform === "istock_getty") { csv = buildIstockGettyCsv(doneItems); name = "istock_getty.csv"; }
     else { csv = ""; name = `${platform}.csv`; }
@@ -383,12 +420,7 @@ export default function Home() {
         display: "flex", flexDirection: "column", overflow: "hidden",
       }}>
         <div style={{ padding: "16px 16px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{
-            display: "inline-flex", alignItems: "center", gap: 7,
-            background: "var(--header-bg)", color: "var(--header-text)",
-            padding: "7px 12px", borderRadius: 9,
-            fontFamily: "var(--font-display)", fontSize: 15,
-          }}>
+          <div className="logo-badge">
             <svg width="14" height="11" viewBox="0 0 18 14" fill="none">
               <path d="M1 1L9 7L1 13" stroke="currentColor" strokeWidth="1.6" />
               <path d="M9 1L17 7L9 13" stroke="currentColor" strokeWidth="1.6" />
@@ -413,7 +445,7 @@ export default function Home() {
         </div>
 
         <div style={{ padding: "0 12px 12px" }}>
-          <button onClick={() => fileInputRef.current.click()} style={ghostBtn}>
+          <button onClick={() => fileInputRef.current.click()} className="btn btn-ghost" style={{ width: "100%" }}>
             + Add images
           </button>
           <input
@@ -473,9 +505,10 @@ export default function Home() {
           <button
             onClick={runBatch}
             disabled={running || items.length === 0}
-            style={{ ...primaryBtn, width: "100%", opacity: running || items.length === 0 ? 0.5 : 1 }}
+            className="btn btn-primary"
+            style={{ width: "100%", padding: "10px 14px", fontSize: 13.5 }}
           >
-            {running ? "Generating…" : "Generate all"}
+            {running ? "Generating…" : "✦ Generate all"}
           </button>
           {items.length > 0 && (
             <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8, textAlign: "center" }}>
@@ -505,13 +538,14 @@ export default function Home() {
               value={context}
               onChange={(e) => setContext(e.target.value)}
               placeholder="Optional context — e.g. corporate, wedding, nature/travel"
-              style={{ ...contextInput, width: "100%", paddingLeft: 32 }}
+              className="context-input"
+              style={{ width: "100%", paddingLeft: 32 }}
             />
           </div>
-          <button onClick={() => setShowSettings(true)} style={{ ...ghostBtn, marginLeft: 12, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <button onClick={() => setShowSettings(true)} className="btn btn-ghost" style={{ marginLeft: 12 }}>
             <span style={{
               display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-              background: keyStatus === "connected" ? "var(--teal)" : "var(--text-faint)",
+              background: keyStatus === "connected" ? "var(--success)" : "var(--text-faint)",
             }} />
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
               <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke="currentColor" strokeWidth="1.6" />
@@ -534,13 +568,14 @@ export default function Home() {
               alignItems: "center", justifyContent: "center", textAlign: "center",
               border: `1.5px dashed ${isDragging ? "var(--accent)" : "var(--border)"}`,
               borderRadius: 14, padding: 24,
-              background: isDragging ? "var(--panel-raised)" : "transparent",
+              background: isDragging ? "var(--accent-soft)" : "transparent",
               transition: "border-color .15s ease, background .15s ease",
             }}>
               <div style={{
-                width: 44, height: 44, borderRadius: 10, background: "var(--panel-raised)",
-                border: "1px solid var(--border)", display: "flex", alignItems: "center",
-                justifyContent: "center", marginBottom: 16, color: "var(--text-dim)",
+                width: 44, height: 44, borderRadius: 10, background: "var(--accent-gradient)",
+                display: "flex", alignItems: "center",
+                justifyContent: "center", marginBottom: 16, color: "#fff",
+                boxShadow: "var(--glow)",
               }}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                   <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
@@ -553,7 +588,7 @@ export default function Home() {
               <div style={{ fontSize: 13, color: "var(--text-faint)", maxWidth: 340, lineHeight: 1.6, marginBottom: 18 }}>
                 Drag JPG or PNG files anywhere on this canvas. We resize them locally before analysis.
               </div>
-              <button onClick={() => fileInputRef.current.click()} style={ghostBtn}>
+              <button onClick={() => fileInputRef.current.click()} className="btn btn-ghost">
                 Browse files
               </button>
             </div>
@@ -594,7 +629,8 @@ export default function Home() {
                   {active.result && active.status !== "processing" && (
                     <button
                       onClick={() => processOne(activeIndex)}
-                      style={{ ...ghostBtn, marginTop: 10, display: "inline-flex", alignItems: "center", gap: 6 }}
+                      className="btn btn-ghost"
+                      style={{ marginTop: 10 }}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
                         <path d="M20 11a8 8 0 10-2.34 5.66M20 4v6h-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
@@ -606,10 +642,10 @@ export default function Home() {
               {active.status === "error" && (
                 <div style={{
                   marginTop: 12, padding: 12, borderRadius: 8,
-                  background: "#2a1a18", border: "1px solid #4a2b26", color: "var(--red)", fontSize: 13,
+                  background: "var(--danger-soft)", border: "1px solid var(--danger)", color: "var(--danger)", fontSize: 13,
                 }}>
                   {active.error}
-                  <button onClick={() => processOne(activeIndex)} style={{ ...ghostBtn, marginLeft: 12, padding: "4px 10px" }}>
+                  <button onClick={() => processOne(activeIndex)} className="btn btn-ghost" style={{ marginLeft: 12, padding: "4px 10px" }}>
                     Retry
                   </button>
                 </div>
@@ -621,7 +657,7 @@ export default function Home() {
                 </div>
               </div>
 
-              {active.result && (
+              {active.result && analysis && (
                 <div style={{ marginTop: 20 }}>
                   <div style={{
                     display: "inline-flex", gap: 4, marginBottom: 18, flexWrap: "wrap",
@@ -632,49 +668,82 @@ export default function Home() {
                       <button
                         key={t.key}
                         onClick={() => setActiveTab(t.key)}
-                        style={activeTab === t.key ? tabActive : tabInactive}
+                        className={`tab-pill${activeTab === t.key ? " active" : ""}`}
                       >
                         {t.label}
                       </button>
                     ))}
                   </div>
 
+                  <div style={{ marginBottom: 14 }}>
+                    <ScoreBadge analysis={analysis} />
+                  </div>
+
                   <div style={{ marginBottom: 18 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <label style={sectionLabel}>Title</label>
+                      <label className="section-label">Title</label>
                       <button
                         onClick={() => copyToClipboard(active.result.platforms[activeTab]?.title || "", "title")}
-                        style={copyBtn}
+                        className="copy-btn"
                       >
                         {copiedField === "title" ? "Copied" : "Copy"}
                       </button>
                     </div>
-                    <div style={{ ...fieldBox, fontFamily: "var(--font-display)", fontSize: 15 }}>
+                    <div className="field-box" style={{ fontFamily: "var(--font-display)", fontSize: 15 }}>
                       {active.result.platforms[activeTab]?.title}
                     </div>
+                    {analysis.titleChecks.map((c, i) => (
+                      <div key={i} style={{ fontSize: 12, marginTop: 4, color: c.ok ? "var(--success)" : "var(--danger)" }}>
+                        {c.ok ? "✓" : "✕"} {c.text}
+                      </div>
+                    ))}
                   </div>
 
                   <div>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <label style={sectionLabel}>
+                      <label className="section-label">
                         Keywords ({active.result.platforms[activeTab]?.keywords.length})
+                        <span style={{ marginLeft: 8 }}>
+                          <span style={{ color: "var(--success)" }}>●</span> good{" "}
+                          <span style={{ color: "var(--warning)", marginLeft: 4 }}>●</span> weak{" "}
+                          <span style={{ color: "var(--danger)", marginLeft: 4 }}>●</span> bad
+                        </span>
                       </label>
                       <button
                         onClick={() => copyToClipboard((active.result.platforms[activeTab]?.keywords || []).join(", "), "keywords")}
-                        style={copyBtn}
+                        className="copy-btn"
                       >
                         {copiedField === "keywords" ? "Copied" : "Copy"}
                       </button>
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
-                      {active.result.platforms[activeTab]?.keywords.map((kw, i) => (
-                        <KeywordChip key={`${kw}-${i}`} text={kw} onRemove={() => removeKeyword(activeIndex, activeTab, i)} />
-                      ))}
+                      {active.result.platforms[activeTab]?.keywords.map((kw, i) => {
+                        const v = verdictByIndex[i] || { verdict: "good", reasons: ["Relevant tag"] };
+                        return (
+                          <KeywordChip key={`${kw}-${i}`} text={kw} verdict={v.verdict} reasons={v.reasons} onRemove={() => removeKeyword(activeIndex, activeTab, i)} />
+                        );
+                      })}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 6 }}>
+                      Hover any tag to see why it passed or failed. Colors: {analysis.colorHits} · use-case phrases: {analysis.useHits}
                     </div>
                   </div>
 
+                  {analysis.suggestions.length > 0 && (
+                    <div style={{
+                      marginTop: 16, padding: "12px 14px", borderRadius: 10,
+                      background: "var(--accent-soft)", border: "1px solid var(--border)",
+                      fontSize: 12.5, color: "var(--text-dim)", lineHeight: 1.7,
+                    }}>
+                      <div style={{ fontWeight: 600, color: "var(--text)", marginBottom: 4 }}>💡 How to get more downloads</div>
+                      {analysis.suggestions.map((s, i) => (
+                        <div key={i}>• {s}</div>
+                      ))}
+                    </div>
+                  )}
+
                   {active.result.flags?.length > 0 && (
-                    <div style={{ marginTop: 18, fontSize: 12.5, color: "var(--accent)" }}>
+                    <div style={{ marginTop: 18, fontSize: 12.5, color: "var(--warning)" }}>
                       ⚠ {active.result.flags.join(", ")}
                     </div>
                   )}
@@ -700,11 +769,11 @@ export default function Home() {
                 {doneItems.length} ready
               </span>
               <span style={{ fontSize: 12, color: "var(--text-faint)", marginRight: 2 }}>Export:</span>
-              <button onClick={() => exportCsv("adobe_stock")} style={ghostBtn}>Adobe Stock CSV</button>
-              <button onClick={() => exportCsv("shutterstock")} style={ghostBtn}>Shutterstock CSV</button>
-              <button onClick={() => exportCsv("istock_getty")} style={ghostBtn}>iStock CSV</button>
-              <button onClick={() => exportCsv("freepik_vecteezy")} style={ghostBtn}>Freepik CSV</button>
-              <button onClick={() => exportCsv("vecteezy")} style={ghostBtn}>Vecteezy CSV</button>
+              <button onClick={() => exportCsv("adobe_stock")} className="btn btn-export">Adobe Stock CSV</button>
+              <button onClick={() => exportCsv("shutterstock")} className="btn btn-export">Shutterstock CSV</button>
+              <button onClick={() => exportCsv("istock_getty")} className="btn btn-export">iStock CSV</button>
+              <button onClick={() => setShowFreepik(true)} className="btn btn-freepik">⬆ Freepik CSV</button>
+              <button onClick={() => exportCsv("vecteezy")} className="btn btn-export">Vecteezy CSV</button>
             </div>
             <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 6 }}>
               Note: iStock/Getty validates keywords against their own controlled vocabulary — review that CSV in their submission tool before final upload.
@@ -736,12 +805,13 @@ export default function Home() {
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder="AIza..."
-              style={contextInput}
+              className="context-input"
+              style={{ width: "100%" }}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-              <button onClick={saveKey} style={primaryBtn}>Save</button>
-              <button onClick={testConnection} style={ghostBtn}>Test connection</button>
-              <button onClick={clearKey} style={ghostBtn}>Clear</button>
+              <button onClick={saveKey} className="btn btn-primary">Save</button>
+              <button onClick={testConnection} className="btn btn-ghost">Test connection</button>
+              <button onClick={clearKey} className="btn btn-ghost">Clear</button>
             </div>
             <div style={{ marginTop: 10, fontSize: 12.5 }}>
               Status:{" "}
@@ -754,34 +824,126 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      {showFreepik && (
+        <div
+          onClick={() => setShowFreepik(false)}
+          style={{ position: "fixed", inset: 0, background: "#00000070", zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 560, maxWidth: "100%", maxHeight: "90vh", overflowY: "auto",
+              background: "var(--panel)", border: "1px solid var(--border)",
+              borderRadius: 16, boxShadow: "var(--shadow)",
+              padding: 24, animation: "rise-in 0.2s ease",
+            }}
+          >
+            <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 500, fontSize: 20, marginTop: 0, marginBottom: 4 }}>
+              Freepik CSV export
+            </h3>
+            <p style={{ fontSize: 12.5, color: "var(--text-dim)", marginTop: 0 }}>
+              Pre-checked against Freepik&apos;s upload rules — header, title length, keyword count — so the file imports cleanly.
+            </p>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer", marginBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={aiGenerated}
+                onChange={(e) => setAiGenerated(e.target.checked)}
+                style={{ width: 15, height: 15, accentColor: "var(--accent)" }}
+              />
+              My images are AI-generated
+              <span style={{ fontSize: 11, color: "var(--text-faint)" }}>(adds _ai_generated tag + Prompt/Model columns)</span>
+            </label>
+            {aiGenerated && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <input
+                  value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)}
+                  placeholder="Prompt (applied to all rows)"
+                  className="context-input" style={{ fontSize: 12 }}
+                />
+                <input
+                  value={aiModel} onChange={(e) => setAiModel(e.target.value)}
+                  placeholder="Model e.g. Midjourney 6"
+                  className="context-input" style={{ fontSize: 12, maxWidth: 170 }}
+                />
+              </div>
+            )}
+
+            <div style={{ marginTop: 12, marginBottom: 12 }}>
+              {freepikIssues.length === 0 && (
+                <div style={{
+                  padding: "12px 14px", borderRadius: 10, fontSize: 13,
+                  background: "var(--success-soft)", border: "1px solid var(--success)", color: "var(--success)",
+                }}>
+                  ✓ All {doneItems.length} rows passed — ready for Freepik upload.
+                </div>
+              )}
+              {freepikErrors.length > 0 && (
+                <div style={{
+                  padding: "12px 14px", borderRadius: 10, fontSize: 13, marginBottom: 8,
+                  background: "var(--danger-soft)", border: "1px solid var(--danger)",
+                }}>
+                  <div style={{ fontWeight: 600, color: "var(--danger)", marginBottom: 6 }}>
+                    ✕ {freepikErrors.length} problem{freepikErrors.length > 1 ? "s" : ""} that Freepik will reject
+                  </div>
+                  {freepikErrors.map((e, i) => (
+                    <div key={i} style={{ color: "var(--text-dim)", marginBottom: 4 }}>
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5 }}>row {e.row} · {e.filename}</span>
+                      <br />{e.message}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {freepikWarnings.length > 0 && (
+                <div style={{
+                  padding: "12px 14px", borderRadius: 10, fontSize: 13,
+                  background: "var(--warning-soft)", border: "1px solid var(--warning)",
+                }}>
+                  <div style={{ fontWeight: 600, color: "var(--warning)", marginBottom: 6 }}>
+                    ⚠ {freepikWarnings.length} auto-fixed / advisory note{freepikWarnings.length > 1 ? "s" : ""}
+                  </div>
+                  <div style={{ maxHeight: 150, overflowY: "auto" }}>
+                    {freepikWarnings.map((w, i) => (
+                      <div key={i} style={{ color: "var(--text-dim)", marginBottom: 4 }}>
+                        <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5 }}>row {w.row} · {w.filename}</span>
+                        <br />{w.message}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {freepikErrors.length > 0 ? (
+                <>
+                  <button
+                    onClick={() => downloadFreepikCsv(true)}
+                    disabled={doneItems.length - freepikErrorRows.size === 0}
+                    className="btn btn-primary"
+                  >
+                    Download valid rows ({doneItems.length - freepikErrorRows.size})
+                  </button>
+                  <button onClick={() => downloadFreepikCsv(false)} className="btn btn-ghost">
+                    Download all anyway
+                  </button>
+                </>
+              ) : (
+                <button onClick={() => downloadFreepikCsv(false)} className="btn btn-primary">
+                  ⬇ Download Freepik CSV ({doneItems.length} rows)
+                </button>
+              )}
+              <button onClick={() => setShowFreepik(false)} className="btn btn-ghost">Cancel</button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 10, lineHeight: 1.6 }}>
+              Upload tip: in the Freepik contributor panel, file names in the CSV must match your uploaded files exactly (including .jpg).
+              If a row fails there, check for renamed files first.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-const ghostBtn = {
-  background: "var(--panel-raised)", color: "var(--text-dim)", border: "1px solid var(--border)",
-  borderRadius: 8, padding: "7px 12px", cursor: "pointer", fontSize: 12.5,
-};
-const primaryBtn = {
-  background: "var(--accent)", color: "var(--accent-text)", border: "none",
-  borderRadius: 8, padding: "8px 14px", cursor: "pointer", fontSize: 13, fontWeight: 600,
-};
-const tabActive = {
-  background: "var(--accent)", color: "var(--accent-text)", border: "none",
-  borderRadius: 999, padding: "7px 14px", cursor: "pointer", fontSize: 12.5, fontWeight: 600,
-};
-const tabInactive = { ...tabActive, background: "transparent", color: "var(--text-dim)", fontWeight: 400 };
-const sectionLabel = { fontSize: 12, color: "var(--text-faint)", letterSpacing: 0 };
-const copyBtn = {
-  background: "none", border: "none", color: "var(--text-faint)",
-  cursor: "pointer", fontSize: 11.5, padding: "2px 4px",
-};
-const fieldBox = {
-  marginTop: 6, padding: "10px 12px", background: "var(--panel-raised)",
-  border: "1px solid var(--border-soft)", borderRadius: 8,
-};
-const contextInput = {
-  flex: 1, padding: "9px 12px", background: "var(--panel-raised)",
-  border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)",
-  fontSize: 13,
-};
