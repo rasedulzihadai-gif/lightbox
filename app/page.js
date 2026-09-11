@@ -9,9 +9,10 @@ import { PROVIDER_REGISTRY, getProvider } from "../lib/provider-registry";
 import {
   loadProviderConfigs, saveProviderField, saveDiscoveredModels,
   loadUiPrefs, saveSelectedProvider, saveFallbackEnabled, saveFallbackOrder,
-  buildRequestProviders,
+  buildRequestProviders, clearAllSettings,
 } from "../lib/client-config";
 import SettingsPanel from "./components/SettingsPanel";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 // Empty slot state used during SSR / before localStorage loads — derived
 // from the registry so every provider always has a well-formed config.
@@ -913,21 +914,76 @@ export default function Home() {
         )}
       </main>
 
-      <SettingsPanel
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
-        configs={cfgs}
-        testMsgs={testMsgs}
-        testingId={testingId}
-        onChange={handleConfigChange}
-        onClear={handleClearProvider}
-        onTest={handleTestProvider}
-        fallbackEnabled={fallbackEnabled}
-        onFallbackToggle={(on) => { setFallbackEnabled(on); saveFallbackEnabled(on); }}
-        fallbackOrder={fallbackOrder}
-        onFallbackOrderChange={(order) => { setFallbackOrder(order); saveFallbackOrder(order); }}
-        selectedProvider={selectedProvider}
-      />
+      <ErrorBoundary
+        // Scoped to the Settings overlay: if the panel itself ever throws at
+        // render time (e.g. a saved value with an unexpected shape), the rest
+        // of the app keeps working and the user gets a recovery card instead
+        // of a white page. Re-opening the panel (resetKey) clears the error.
+        resetKey={showSettings}
+        renderFallback={(err, resetBoundary) => (
+          <div onClick={() => { resetBoundary(); setShowSettings(false); }} className="modal-backdrop">
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="settings-panel"
+              role="alertdialog"
+              aria-label="Settings could not open"
+            >
+              <div className="settings-head">
+                <h3>Settings could not open</h3>
+                <button
+                  onClick={() => { resetBoundary(); setShowSettings(false); }}
+                  className="btn btn-ghost"
+                  aria-label="Close"
+                >
+                  ✕ Close
+                </button>
+              </div>
+              <p className="settings-sub">
+                The settings panel hit an unexpected error while rendering. Your saved keys are
+                untouched — you can retry, or clear this app&apos;s saved browser data (API keys,
+                provider choices, theme) and start fresh.
+              </p>
+              <div
+                style={{
+                  padding: "10px 12px", borderRadius: 8, fontSize: 12, wordBreak: "break-word",
+                  fontFamily: "var(--font-mono)", background: "var(--danger-soft)",
+                  border: "1px solid var(--danger)", color: "var(--danger)", marginBottom: 14,
+                }}
+              >
+                {String(err?.message || err)}
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button onClick={resetBoundary} className="btn btn-primary">
+                  ↻ Try opening again
+                </button>
+                <button
+                  onClick={() => { clearAllSettings(); window.location.reload(); }}
+                  className="btn btn-ghost"
+                >
+                  Clear saved settings &amp; reload
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      >
+        <SettingsPanel
+          open={showSettings}
+          onClose={() => setShowSettings(false)}
+          configs={cfgs}
+          testMsgs={testMsgs}
+          testingId={testingId}
+          onChange={handleConfigChange}
+          onClear={handleClearProvider}
+          onTest={handleTestProvider}
+          fallbackEnabled={fallbackEnabled}
+          onFallbackToggle={(on) => { setFallbackEnabled(on); saveFallbackEnabled(on); }}
+          fallbackOrder={fallbackOrder}
+          onFallbackOrderChange={(order) => { setFallbackOrder(order); saveFallbackOrder(order); }}
+          selectedProvider={selectedProvider}
+          onResetAll={() => { clearAllSettings(); window.location.reload(); }}
+        />
+      </ErrorBoundary>
 
       {showFreepik && (
         <div

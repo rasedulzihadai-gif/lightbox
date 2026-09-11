@@ -31,6 +31,7 @@ const scenarios = [
   },
   {
     name: "power user (gemini + xkiro, last provider + fallback saved)",
+    expectSelected: "xKiro",
     seed: {
       mstock_gemini_key: "AIzaFAKEKEY123",
       mstock_key_xkiro: "xkiro-key",
@@ -39,6 +40,25 @@ const scenarios = [
       mstock_fallback_enabled: "1",
       mstock_fallback_order: JSON.stringify(["xkiro", "gemini", "openai"]),
       mstock_theme: "dark",
+    },
+  },
+  {
+    // Simulates a browser whose saved data went bad across upgrades: corrupt
+    // JSON, wire/status values that no longer exist, a fallback order
+    // containing a removed slot AND a duplicate, plus a selected provider
+    // that is gone. Opening Settings on this state must NEVER white-screen —
+    // this is the exact class of crash users reported as a blank page.
+    name: "poisoned storage (corrupt JSON, unknown+duplicate fallback ids, bad wire/status)",
+    // The saved pick (ghost-slot) no longer exists → the app must degrade to
+    // a configured provider instead of breaking.
+    expectSelected: "Google Gemini",
+    seed: {
+      mstock_key_gemini: "AIzaFAKEKEY123",
+      mstock_models_gemini: "{corrupt json",
+      mstock_wire_gemini: "not-a-format",
+      mstock_status_gemini: "garbage",
+      mstock_fallback_order: JSON.stringify(["xkiro", "ghost-slot", "xkiro"]),
+      mstock_provider: "ghost-slot",
     },
   },
 ];
@@ -126,7 +146,9 @@ async function runScenario(sc, attempt = 1) {
 
   // Errors caused by jsdom's own environment gaps (NOT app bugs): the
   // sandbox also blocks fonts.googleapis.com, which jsdom reports loudly.
-  const envNoise = (e) => /fonts\.googleapis|favicon|socket|TLS/i.test(e);
+  // "Not implemented: navigation" is jsdom declining window.location.reload()
+  // — fired by the intentional "Clear saved settings" recovery action.
+  const envNoise = (e) => /fonts\.googleapis|favicon|socket|TLS|Not implemented: navigation/i.test(e);
   const appErrors = errors.filter((e) => !envNoise(e));
 
   ok("no app-level client-side exceptions during load/hydration", appErrors.length === 0, appErrors.join(" | ").slice(0, 500));
@@ -140,8 +162,9 @@ async function runScenario(sc, attempt = 1) {
     const optionCount = select.querySelectorAll("option").length;
     const selected = select.selectedOptions?.[0]?.textContent || "";
     ok("selector lists configured provider(s)", optionCount >= 1, `${optionCount} option(s)`);
-    if (sc.seed.mstock_provider) {
-      ok("selector defaults to last-used provider", selected.includes("xKiro"), selected);
+    if (sc.seed.mstock_provider && sc.expectSelected) {
+      ok("selector defaults sensibly (last-used, or a configured slot when the saved pick is unknown)",
+        selected.includes(sc.expectSelected), selected);
     }
   }
 
@@ -173,6 +196,21 @@ async function runScenario(sc, attempt = 1) {
     ok("fallback toggle renders", !!doc.querySelector(".fallback-toggle input[type='checkbox']"));
     ok("API key input renders (password-style)", !!doc.querySelector('input[type="password"]'));
     ok("base URL input renders", !!doc.querySelector('input[id^="baseurl-"]'));
+
+    // Recovery escape hatch must exist inside the panel itself.
+    const resetBtn = [...doc.querySelectorAll(".settings-panel button")]
+      .find((b) => b.textContent.includes("Clear saved settings"));
+    ok("'Clear saved settings' recovery button renders", !!resetBtn);
+
+    // In the poisoned scenario, prove the escape hatch actually works: one
+    // click removes every mstock_* key (the page then reloads — jsdom noise
+    // filtered above).
+    if (resetBtn && sc.name.startsWith("poisoned")) {
+      resetBtn.click();
+      await new Promise((r) => setTimeout(r, 500));
+      const left = Object.keys(dom.window.localStorage).filter((k) => k.startsWith("mstock_"));
+      ok("clear wipes every mstock_* key", left.length === 0, left.join(", ") || "clean");
+    }
   }
 
   console.log(`\n── ${sc.name} ──`);
