@@ -24,17 +24,26 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
   const reg = getProvider(id);
   const [showKey, setShowKey] = useState(false);
   if (!reg) return null;
+  // Defensive defaults: a config slot should always exist (both EMPTY_CONFIGS
+  // and loadProviderConfigs() derive from the registry), but a stale/odd
+  // value must degrade to an empty card — never a white screen.
+  const cfg = {
+    key: "", baseUrl: "", model: "",
+    wireFormat: reg.defaultWireFormat, status: "not-set", discoveredModels: [],
+    ...config,
+  };
+  const notes = Array.isArray(reg.notes) ? reg.notes : [];
   // Respect the slot's chosen wire format when showing the default —
   // xKiro/AgentRouter use a different default base per format (/v1 vs none).
-  const effectiveBaseUrl = config.baseUrl || defaultBaseUrl(reg, config.wireFormat);
-  const datalistModels = [...new Set([...(reg.models || []), ...(config.discoveredModels || [])])];
+  const effectiveBaseUrl = cfg.baseUrl || defaultBaseUrl(reg, cfg.wireFormat);
+  const datalistModels = [...new Set([...(reg.models || []), ...(Array.isArray(cfg.discoveredModels) ? cfg.discoveredModels : [])])];
   const datalistId = `models-${id}`;
 
   return (
     <div className="provider-card">
       <div className="provider-card-head">
         <span className="provider-name">{reg.label}</span>
-        <StatusBadge status={config.status} />
+        <StatusBadge status={cfg.status} />
       </div>
 
       <label className="field-label" htmlFor={`key-${id}`}>API key</label>
@@ -42,7 +51,7 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
         <input
           id={`key-${id}`}
           type={showKey ? "text" : "password"}
-          value={config.key}
+          value={cfg.key}
           onChange={(e) => onChange(id, "key", e.target.value)}
           placeholder={reg.keyHint}
           className="context-input input-sm"
@@ -72,7 +81,7 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
           className="context-input input-sm input-mono"
           spellCheck={false}
         />
-        {config.baseUrl && config.baseUrl !== reg.baseUrl && (
+        {cfg.baseUrl && cfg.baseUrl !== reg.baseUrl && (
           <button
             type="button"
             onClick={() => onChange(id, "baseUrl", "")}
@@ -90,7 +99,7 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
             <label className="field-label" htmlFor={`wire-${id}`}>API format</label>
             <select
               id={`wire-${id}`}
-              value={config.wireFormat}
+              value={cfg.wireFormat}
               onChange={(e) => onChange(id, "wireFormat", e.target.value)}
               className="context-input input-sm"
             >
@@ -111,7 +120,7 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
             id={`model-${id}`}
             type="text"
             list={datalistModels.length ? datalistId : undefined}
-            value={config.model}
+            value={cfg.model}
             onChange={(e) => onChange(id, "model", e.target.value)}
             placeholder={reg.modelHint}
             className="context-input input-sm input-mono"
@@ -126,13 +135,13 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
       </div>
 
       <div className="provider-actions">
-        <button onClick={() => onTest(id)} disabled={testing || !config.key} className="btn btn-ghost">
+        <button onClick={() => onTest(id)} disabled={testing || !cfg.key} className="btn btn-ghost">
           {testing ? "Testing…" : "Test connection"}
         </button>
-        <button onClick={() => onClear(id)} disabled={!config.key && !config.baseUrl && !config.model} className="btn btn-ghost">
+        <button onClick={() => onClear(id)} disabled={!cfg.key && !cfg.baseUrl && !cfg.model} className="btn btn-ghost">
           Clear
         </button>
-        {config.status === "unverified" && config.key && (
+        {cfg.status === "unverified" && cfg.key && (
           <span className="unverified-hint">key saved — not tested yet</span>
         )}
       </div>
@@ -141,9 +150,9 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
         <div className={`test-msg test-${testMsg.tone || (testMsg.ok ? "ok" : "bad")}`}>{testMsg.message}</div>
       )}
 
-      {reg.notes.length > 0 && (
+      {notes.length > 0 && (
         <div className="provider-notes">
-          {reg.notes.map((n, i) => (
+          {notes.map((n, i) => (
             <div key={i} className={`note-box note-${noteTone(n)}`}>{n}</div>
           ))}
         </div>
@@ -154,6 +163,8 @@ function ProviderCard({ id, config, testMsg, testing, onChange, onClear, onTest 
 
 function FallbackRow({ id, index, dragging, onDragStart, onDragOver, onDrop, onDragEnd, configured, selected }) {
   const reg = getProvider(id);
+  // Unknown id (registry changed since the order was saved) → skip silently.
+  if (!reg) return null;
   return (
     <div
       className={`fallback-row${dragging ? " dragging" : ""}${selected ? " selected" : ""}`}
@@ -177,6 +188,7 @@ export default function SettingsPanel({
   open, onClose, configs, testMsgs, testingId,
   onChange, onClear, onTest,
   fallbackEnabled, onFallbackToggle, fallbackOrder, onFallbackOrderChange, selectedProvider,
+  onResetAll,
 }) {
   const dragState = useRef({ from: -1, over: -1 });
   const [, force] = useState(0);
@@ -205,9 +217,14 @@ export default function SettingsPanel({
     force((n) => n + 1);
   }
 
-  const order = fallbackOrder && fallbackOrder.length
-    ? fallbackOrder
-    : PROVIDER_REGISTRY.map((p) => p.id);
+  // Dedupe + drop unknown ids: a hand-edited or stale saved order must not
+  // break (or double-render) the fallback list.
+  const seen = new Set();
+  const order = (
+    fallbackOrder && fallbackOrder.length
+      ? fallbackOrder
+      : PROVIDER_REGISTRY.map((p) => p.id)
+  ).filter((id) => getProvider(id) && !seen.has(id) && seen.add(id));
   const configuredCount = PROVIDER_REGISTRY.filter((p) => configs[p.id]?.key).length;
 
   return (
@@ -275,6 +292,26 @@ export default function SettingsPanel({
               ? "Add a key to at least one provider above first."
               : `At runtime your manually selected provider always answers first; the others are tried in this order only if it fails and the toggle is on.`}
           </p>
+        </div>
+
+        <div
+          style={{
+            marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-soft)",
+            display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap",
+          }}
+        >
+          <span style={{ fontSize: 11.5, color: "var(--text-faint)", lineHeight: 1.5, maxWidth: 340 }}>
+            Settings behaving oddly after a bad save? This wipes every saved slot, provider
+            choice and theme — then reloads the app fresh.
+          </span>
+          <button
+            type="button"
+            onClick={onResetAll}
+            className="btn btn-ghost"
+            title="Remove all mstock_* browser data for this app and reload"
+          >
+            Clear saved settings
+          </button>
         </div>
       </div>
     </div>
