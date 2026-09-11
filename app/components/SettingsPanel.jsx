@@ -1,6 +1,6 @@
 "use client";
 import { useRef, useState } from "react";
-import { PROVIDER_REGISTRY, getProvider, WIRE_FORMAT_LABELS } from "../../lib/provider-registry";
+import { PROVIDER_REGISTRY, getProvider, defaultBaseUrl, WIRE_FORMAT_LABELS } from "../../lib/provider-registry";
 
 function noteTone(text) {
   if (/KNOWN RESTRICTION|UNAUTHORIZED_CLIENT/.test(text)) return "danger";
