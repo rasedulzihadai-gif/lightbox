@@ -5,6 +5,22 @@ import {
   buildIstockGettyCsv, validateFreepikRows, downloadCsv,
 } from "../lib/csv";
 import { analyzeKeywords, gradeColor } from "../lib/keywords";
+import { PROVIDER_REGISTRY, getProvider } from "../lib/provider-registry";
+import {
+  loadProviderConfigs, saveProviderField, saveDiscoveredModels,
+  loadUiPrefs, saveSelectedProvider, saveFallbackEnabled, saveFallbackOrder,
+  buildRequestProviders,
+} from "../lib/client-config";
+import SettingsPanel from "./components/SettingsPanel";
+
+// Empty slot state used during SSR / before localStorage loads — derived
+// from the registry so every provider always has a well-formed config.
+const EMPTY_CONFIGS = Object.fromEntries(
+  PROVIDER_REGISTRY.map((p) => [
+    p.id,
+    { key: "", baseUrl: "", model: "", wireFormat: p.defaultWireFormat, status: "not-set", discoveredModels: [] },
+  ])
+);
 
 const PLATFORM_TABS = [
   { key: "adobe_stock", label: "Adobe Stock" },
@@ -147,9 +163,17 @@ function ScoreBadge({ analysis }) {
 }
 
 export default function Home() {
-  const [apiKey, setApiKey] = useState("");
+  // null until localStorage loads on the client (this component also SSRs,
+  // where localStorage doesn't exist) — `cfgs` below substitutes empties.
+  const [configs, setConfigs] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [keyStatus, setKeyStatus] = useState("not-set");
+  // Manual provider choice (persisted — defaults to whichever was used last).
+  const [selectedProvider, setSelectedProvider] = useState(null);
+  // Opt-in automatic fallback chain (off by default; manual pick is the norm).
+  const [fallbackEnabled, setFallbackEnabled] = useState(false);
+  const [fallbackOrder, setFallbackOrder] = useState(null);
+  const [testMsgs, setTestMsgs] = useState({});
+  const [testingId, setTestingId] = useState(null);
   const [context, setContext] = useState("");
   const [items, setItems] = useState([]);
   const [activeIndex, setActiveIndex] = useState(null);
@@ -191,32 +215,84 @@ export default function Home() {
   itemsRef.current = items;
 
   useEffect(() => {
-    const saved = localStorage.getItem("mstock_gemini_key");
-    if (saved) {
-      setApiKey(saved);
-      setKeyStatus("connected");
-    }
+    const loaded = loadProviderConfigs();
+    setConfigs(loaded);
+    const prefs = loadUiPrefs();
+    const configured = Object.keys(loaded).filter((id) => loaded[id].key);
+    const sel = prefs.selectedProvider && configured.includes(prefs.selectedProvider)
+      ? prefs.selectedProvider
+      : configured[0] || null;
+    setSelectedProvider(sel);
+    setFallbackEnabled(prefs.fallbackEnabled);
+    setFallbackOrder(prefs.fallbackOrder);
   }, []);
 
-  function saveKey() {
-    localStorage.setItem("mstock_gemini_key", apiKey);
-    setKeyStatus(apiKey ? "connected" : "not-set");
+  const cfgs = configs || EMPTY_CONFIGS;
+  const configuredIds = PROVIDER_REGISTRY.filter((p) => cfgs[p.id]?.key).map((p) => p.id);
+
+  function handleConfigChange(id, field, value) {
+    setConfigs((prev) => {
+      const slot = { ...prev[id], [field]: value };
+      // Changing the key invalidates any previous test verdict.
+      if (field === "key") slot.status = value ? "unverified" : "not-set";
+      const next = { ...prev, [id]: slot };
+      saveProviderField(id, field, value);
+      if (field === "key") saveProviderField(id, "status", slot.status);
+      return next;
+    });
   }
 
-  function clearKey() {
-    localStorage.removeItem("mstock_gemini_key");
-    setApiKey("");
-    setKeyStatus("not-set");
+  function handleClearProvider(id) {
+    setConfigs((prev) => ({
+      ...prev,
+      [id]: { ...prev[id], key: "", baseUrl: "", model: "", status: "not-set", discoveredModels: [] },
+    }));
+    saveProviderField(id, "key", "");
+    saveProviderField(id, "baseUrl", "");
+    saveProviderField(id, "model", "");
+    saveProviderField(id, "status", "not-set");
+    saveDiscoveredModels(id, []);
+    setTestMsgs((m) => ({ ...m, [id]: null }));
+    if (selectedProvider === id) setSelectedProvider(null);
   }
 
-  async function testConnection() {
-    setKeyStatus("testing");
+  async function handleTestProvider(id) {
+    if (testingId || !cfgs[id]?.key) return;
+    setTestingId(id);
+    setTestMsgs((m) => ({ ...m, [id]: null }));
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-      setKeyStatus(res.ok ? "connected" : "invalid");
-    } catch {
-      setKeyStatus("invalid");
+      const res = await fetch("/api/test-provider", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          providerId: id,
+          apiKey: cfgs[id].key,
+          baseUrl: cfgs[id].baseUrl || undefined,
+          wireFormat: cfgs[id].wireFormat,
+        }),
+      });
+      const data = await res.json();
+      const status = data.status === "unreachable" ? "unverified" : (data.status || "unverified");
+      setConfigs((prev) => ({ ...prev, [id]: { ...prev[id], status } }));
+      saveProviderField(id, "status", status);
+      if (Array.isArray(data.models) && data.models.length > 0) {
+        saveDiscoveredModels(id, data.models);
+        setConfigs((prev) => ({ ...prev, [id]: { ...prev[id], discoveredModels: data.models } }));
+      }
+      setTestMsgs((m) => ({
+        ...m,
+        [id]: { ok: !!data.ok, message: data.message || (data.ok ? "Connected." : "Test failed."), tone: data.ok ? "ok" : "bad" },
+      }));
+    } catch (err) {
+      setTestMsgs((m) => ({ ...m, [id]: { ok: false, message: `Test request failed: ${String(err.message || err)}`, tone: "bad" } }));
+    } finally {
+      setTestingId(null);
     }
+  }
+
+  function handleSelectProvider(id) {
+    setSelectedProvider(id);
+    saveSelectedProvider(id); // per-session/per-batch choice persists as "last used"
   }
 
   function handleFiles(fileList) {
@@ -296,35 +372,50 @@ export default function Home() {
     // fixes the "stale error stays visible after a later success" bug.
     setItems((prev) => {
       const copy = [...prev];
-      copy[index] = { ...copy[index], status: "processing", error: null };
+      copy[index] = { ...copy[index], status: "processing", error: null, attempts: null };
       return copy;
     });
     try {
       const resized = await resizeImage(itemsRef.current[index].file);
       const base64 = await fileToBase64(resized);
+      // Manual pick first; the other configured providers follow ONLY if the
+      // user opted in to automatic fallback (in their drag-ordered sequence).
+      const providers = buildRequestProviders(cfgs, selectedProvider, fallbackEnabled, fallbackOrder);
+      if (providers.length === 0) {
+        throw new Error("No provider with a saved API key — open Settings and configure a slot first.");
+      }
       const res = await fetch("/api/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Provider-Key": apiKey },
-        body: JSON.stringify({ imageBase64: base64, mimeType: "image/jpeg", context }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64, mimeType: "image/jpeg", context, providers }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Generation failed");
+      if (!res.ok) {
+        const err = new Error(data.error || "Generation failed");
+        err.attempts = data.attempts;
+        throw err;
+      }
       setItems((prev) => {
         const copy = [...prev];
-        copy[index] = { ...copy[index], status: "done", result: data, error: null };
+        copy[index] = { ...copy[index], status: "done", result: data, error: null, attempts: null };
         return copy;
       });
     } catch (err) {
       setItems((prev) => {
         const copy = [...prev];
-        copy[index] = { ...copy[index], status: "error", error: String(err.message || err) };
+        copy[index] = {
+          ...copy[index],
+          status: "error",
+          error: String(err.message || err),
+          attempts: err.attempts || null,
+        };
         return copy;
       });
     }
   }
 
   async function runBatch() {
-    if (!apiKey) {
+    if (!selectedProvider || !cfgs[selectedProvider]?.key) {
       setShowSettings(true);
       return;
     }
@@ -542,10 +633,33 @@ export default function Home() {
               style={{ width: "100%", paddingLeft: 32 }}
             />
           </div>
-          <button onClick={() => setShowSettings(true)} className="btn btn-ghost" style={{ marginLeft: 12 }}>
+          <div className="provider-picker" style={{ marginLeft: 12 }} title="Which provider's AI answers this batch">
+            <span className={`picker-dot dot-${(selectedProvider && cfgs[selectedProvider]?.status) || "not-set"}`} />
+            <select
+              value={selectedProvider || ""}
+              onChange={(e) => handleSelectProvider(e.target.value)}
+              className="provider-select"
+              disabled={configuredIds.length === 0}
+              aria-label="AI provider for this batch"
+            >
+              {configuredIds.length === 0 && (
+                <option value="">No provider configured</option>
+              )}
+              {configuredIds.map((id) => (
+                <option key={id} value={id}>
+                  {getProvider(id).label}{cfgs[id].model ? ` · ${cfgs[id].model}` : ""}
+                </option>
+              ))}
+            </select>
+            {configuredIds.length === 0 && (
+              <button onClick={() => setShowSettings(true)} className="link-btn">Set up a provider</button>
+            )}
+          </div>
+
+          <button onClick={() => setShowSettings(true)} className="btn btn-ghost" style={{ marginLeft: 8 }}>
             <span style={{
               display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-              background: keyStatus === "connected" ? "var(--success)" : "var(--text-faint)",
+              background: configuredIds.length > 0 ? "var(--success)" : "var(--text-faint)",
             }} />
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
               <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke="currentColor" strokeWidth="1.6" />
@@ -645,6 +759,17 @@ export default function Home() {
                   background: "var(--danger-soft)", border: "1px solid var(--danger)", color: "var(--danger)", fontSize: 13,
                 }}>
                   {active.error}
+                  {active.attempts?.length > 1 && (
+                    <div className="attempt-list">
+                      {active.attempts.map((a, i) => (
+                        <div key={i} className={`attempt-line ${a.ok ? "ok" : "fail"}`}>
+                          {a.ok ? "✓" : "✕"} {a.provider} · <span style={{ fontFamily: "var(--font-mono)" }}>{a.model}</span>
+                          {a.error ? ` — ${a.error}` : ""}
+                          {a.info ? ` — ${a.info}` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <button onClick={() => processOne(activeIndex)} className="btn btn-ghost" style={{ marginLeft: 12, padding: "4px 10px" }}>
                     Retry
                   </button>
@@ -748,9 +873,15 @@ export default function Home() {
                     </div>
                   )}
 
-                  {active.result._meta?.fellBack && (
-                    <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--text-faint)" }}>
-                      Primary model was busy — answered by {active.result._meta.modelUsed} instead.
+                  {active.result._meta && (
+                    <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--text-faint)", lineHeight: 1.6 }}>
+                      Answered by <strong style={{ color: "var(--text-dim)" }}>{active.result._meta.providerLabel}</strong>
+                      {" · "}
+                      <span style={{ fontFamily: "var(--font-mono)" }}>{active.result._meta.modelUsed}</span>
+                      {active.result._meta.fellBack && " — after a fallback (first choice was unavailable)"}
+                      {active.result._meta.modelReportedByProvider &&
+                        active.result._meta.modelReportedByProvider !== active.result._meta.modelRequested &&
+                        ` — provider reports it actually routed to ${active.result._meta.modelReportedByProvider}`}
                     </div>
                   )}
                 </div>
@@ -782,48 +913,21 @@ export default function Home() {
         )}
       </main>
 
-      {showSettings && (
-        <div
-          onClick={() => setShowSettings(false)}
-          style={{ position: "fixed", inset: 0, background: "#00000066", zIndex: 10 }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              position: "absolute", right: 12, top: 12, bottom: 12, width: 360,
-              background: "var(--panel)", border: "1px solid var(--border)",
-              borderRadius: 14, boxShadow: "var(--shadow)",
-              padding: 24, animation: "rise-in 0.2s ease",
-            }}
-          >
-            <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 400, fontSize: 19, marginTop: 0 }}>Gemini API key</h3>
-            <p style={{ fontSize: 12.5, color: "var(--text-dim)" }}>
-              Get a key at aistudio.google.com/app/apikey. Stored only in this browser — never saved on our servers.
-            </p>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="AIza..."
-              className="context-input"
-              style={{ width: "100%" }}
-            />
-            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-              <button onClick={saveKey} className="btn btn-primary">Save</button>
-              <button onClick={testConnection} className="btn btn-ghost">Test connection</button>
-              <button onClick={clearKey} className="btn btn-ghost">Clear</button>
-            </div>
-            <div style={{ marginTop: 10, fontSize: 12.5 }}>
-              Status:{" "}
-              <StatusDot status={
-                keyStatus === "connected" ? "done" :
-                keyStatus === "invalid" ? "error" :
-                keyStatus === "testing" ? "processing" : "pending"
-              } />
-            </div>
-          </div>
-        </div>
-      )}
+      <SettingsPanel
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        configs={cfgs}
+        testMsgs={testMsgs}
+        testingId={testingId}
+        onChange={handleConfigChange}
+        onClear={handleClearProvider}
+        onTest={handleTestProvider}
+        fallbackEnabled={fallbackEnabled}
+        onFallbackToggle={(on) => { setFallbackEnabled(on); saveFallbackEnabled(on); }}
+        fallbackOrder={fallbackOrder}
+        onFallbackOrderChange={(order) => { setFallbackOrder(order); saveFallbackOrder(order); }}
+        selectedProvider={selectedProvider}
+      />
 
       {showFreepik && (
         <div
